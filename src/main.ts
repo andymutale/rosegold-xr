@@ -10,8 +10,7 @@ import { createCharacterRenderer } from './render/characterRenderer';
 import { createPlacementMarker, placeAtSurface } from './render/placementMarker';
 import { createScene } from './render/scene';
 import { showGameState, showStatusMessage } from './ui/hud';
-import { createArSession } from './xr/arSession';
-import { getSurfaceHit, getSurfacePlacement } from './xr/hitTest';
+import { createArSession, type ArPlacement } from './xr/arSession';
 import { createRoomUnderstanding, fitBoardToRoomFloor } from './xr/roomUnderstanding';
 
 /** Keeps game simulation speed independent from the display refresh rate. */
@@ -69,21 +68,14 @@ function main(): void {
     let timeSinceLastStep = 0;
     let previousScore = startingState.score;
     let hasBoardBeenPlaced = false;
-    let latestSurfaceHit: XRHitTestResult | null = null;
+    let latestSurfacePlacement: ArPlacement | null = null;
     let latestRoomFloor: ReturnType<typeof roomUnderstanding.update>['floor'] = null;
-    let activeXrSession: XRSession | null = null;
     let previousRoomScanLabel = '';
     let floorWasDetected = false;
 
-    // Called by the XR 'select' event (a screen tap in handheld AR), not by every frame.
+    // Called by the AR session's 'select' event (a screen tap in handheld AR), not by every frame.
     const placeBoardOnSurface = (): void => {
-      if (!renderer.xr.isPresenting || hasBoardBeenPlaced) {
-        return;
-      }
-
-      const referenceSpace = renderer.xr.getReferenceSpace();
-      if (!referenceSpace) {
-        showStatusMessage('Unable to determine the AR reference space.');
+      if (!arSession.isPresenting() || hasBoardBeenPlaced) {
         return;
       }
 
@@ -115,37 +107,23 @@ function main(): void {
         return;
       }
 
-      // Surface-hit fallback keeps AR playable on browsers that do not expose
-      // plane detection. It intentionally uses a smaller, phone-friendly board.
-      if (!latestSurfaceHit) {
+      // Surface placement (WebXR hit testing or Zappar instant tracking) keeps AR playable on
+      // devices that do not expose plane detection. It intentionally uses a smaller, phone-friendly board.
+      if (!latestSurfacePlacement) {
         showStatusMessage('Still scanning for a floor. Move the phone slowly, then tap again.');
         return;
       }
 
-      const surfacePlacement = getSurfacePlacement({ hit: latestSurfaceHit, referenceSpace });
-      if (!surfacePlacement) {
-        showStatusMessage('Could not read the surface pose. Move the camera and try again.');
-        return;
-      }
-
-      placeAtSurface({ object: boardRenderer.board, ...surfacePlacement, scale: FALLBACK_AR_BOARD_SCALE });
+      const { position, quaternion, boardScale = FALLBACK_AR_BOARD_SCALE } = latestSurfacePlacement;
+      placeAtSurface({ object: boardRenderer.board, position, quaternion, scale: boardScale });
       boardRenderer.board.visible = true;
       hasBoardBeenPlaced = true;
       placementMarker.visible = false;
-      showStatusMessage('Maze placed using surface hit testing. Room fitting is unavailable on this device.');
-    };
-
-    // XR sessions can end and restart; keep exactly one placement listener on the current session.
-    const syncArSelectListener = (): void => {
-      const nextSession = renderer.xr.getSession() ?? null;
-
-      if (nextSession === activeXrSession) {
-        return;
-      }
-
-      activeXrSession?.removeEventListener('select', placeBoardOnSurface);
-      activeXrSession = nextSession;
-      activeXrSession?.addEventListener('select', placeBoardOnSurface);
+      showStatusMessage(
+        arSession.getBackend() === 'zappar'
+          ? 'Maze placed using camera tracking. Swipe to move.'
+          : 'Maze placed using surface hit testing. Room fitting is unavailable on this device.',
+      );
     };
 
     const stepGame = (): void => {
@@ -169,7 +147,7 @@ function main(): void {
       previousScore = state.score;
       drawGame(state);
       showStatusMessage(
-        renderer.xr.isPresenting && !hasBoardBeenPlaced
+        arSession.isPresenting() && !hasBoardBeenPlaced
           ? 'Move the phone slowly to scan the room floor, then tap to place the maze.'
           : 'Game reset. Use arrow keys, WASD, or swipe to move.',
       );
@@ -177,7 +155,7 @@ function main(): void {
 
     // Every AR session starts with a fresh scan and requires a new placement tap.
     const handleArSessionStart = (): void => {
-      latestSurfaceHit = null;
+      latestSurfacePlacement = null;
       latestRoomFloor = null;
       hasBoardBeenPlaced = false;
       floorWasDetected = false;
@@ -187,12 +165,16 @@ function main(): void {
       roomUnderstanding.clear();
       const roomScanElement = document.getElementById('room-scan');
       if (roomScanElement) roomScanElement.textContent = 'Room scan: scanning…';
-      showStatusMessage('Move the phone slowly to scan the room floor. Tap to fit the maze inside the detected floor.');
+      showStatusMessage(
+        arSession.getBackend() === 'zappar'
+          ? 'Point the camera at the floor, then tap to place the maze.'
+          : 'Move the phone slowly to scan the room floor. Tap to fit the maze inside the detected floor.',
+      );
     };
 
     // AR coordinates are session-relative; restore the known demo layout and origin after leaving AR.
     const handleArSessionEnd = (): void => {
-      latestSurfaceHit = null;
+      latestSurfacePlacement = null;
       latestRoomFloor = null;
       hasBoardBeenPlaced = false;
       floorWasDetected = false;
@@ -216,24 +198,23 @@ function main(): void {
     };
 
     resetButton?.addEventListener('click', resetGame);
-    renderer.xr.addEventListener('sessionstart', handleArSessionStart);
-    renderer.xr.addEventListener('sessionend', handleArSessionEnd);
+    const removeArListeners = [
+      arSession.addEventListener('sessionstart', handleArSessionStart),
+      arSession.addEventListener('sessionend', handleArSessionEnd),
+      arSession.addEventListener('select', placeBoardOnSurface),
+    ];
 
     renderer.setAnimationLoop((_timestamp, frame) => {
       const elapsedSeconds = clock.getDelta();
-      syncArSelectListener();
+      const isArPresenting = arSession.isPresenting();
 
-      if (renderer.xr.isPresenting && frame) {
-        const referenceSpace = renderer.xr.getReferenceSpace();
-        latestSurfaceHit = getSurfaceHit({
-          frame,
-          hitTestSource: arSession.getHitTestSource(),
-          referenceSpace,
-        });
-
-        // Update the XR store before reading its plane/mesh arrays; they are refreshed from this frame.
+      // WebXR delivers an XRFrame here; camera-tracked (Zappar) AR runs without one.
+      if (isArPresenting && (frame || arSession.getBackend() !== 'webxr')) {
+        // Update the session before reading its plane/mesh arrays; they are refreshed from this frame.
         arSession.update(frame, elapsedSeconds * 1000);
-        const roomScan = referenceSpace
+        const referenceSpace = arSession.getReferenceSpace();
+        latestSurfacePlacement = arSession.getSurfacePlacement(frame);
+        const roomScan = frame && referenceSpace
           ? roomUnderstanding.update(
               frame,
               referenceSpace,
@@ -246,7 +227,9 @@ function main(): void {
         const floorDimensions = latestRoomFloor
           ? `${latestRoomFloor.width.toFixed(1)} × ${latestRoomFloor.depth.toFixed(1)} m`
           : 'looking for a large horizontal floor';
-        const roomScanLabel = `${roomScan.planeCount} planes · ${roomScan.meshCount} meshes · ${floorDimensions}`;
+        const roomScanLabel = arSession.getBackend() === 'zappar'
+          ? 'not available with camera tracking · tap to place'
+          : `${roomScan.planeCount} planes · ${roomScan.meshCount} meshes · ${floorDimensions}`;
         if (roomScanLabel !== previousRoomScanLabel) {
           const roomScanElement = document.getElementById('room-scan');
           if (roomScanElement) roomScanElement.textContent = `Room scan: ${roomScanLabel}`;
@@ -260,17 +243,15 @@ function main(): void {
           );
         }
 
-        const surfacePlacement = latestSurfaceHit && referenceSpace
-          ? getSurfacePlacement({ hit: latestSurfaceHit, referenceSpace })
-          : null;
-        placementMarker.visible = surfacePlacement !== null && !hasBoardBeenPlaced && !latestRoomFloor;
+        placementMarker.visible = latestSurfacePlacement !== null && !hasBoardBeenPlaced && !latestRoomFloor;
 
-        if (placementMarker.visible && surfacePlacement) {
-          placeAtSurface({ object: placementMarker, ...surfacePlacement });
+        if (placementMarker.visible && latestSurfacePlacement) {
+          const { position, quaternion, markerScale = 1 } = latestSurfacePlacement;
+          placeAtSurface({ object: placementMarker, position, quaternion, scale: markerScale });
           placementMarker.position.y += MARKER_HEIGHT_OFFSET;
         }
       } else {
-        latestSurfaceHit = null;
+        latestSurfacePlacement = null;
         latestRoomFloor = null;
         roomUnderstanding.clear();
         const roomScanElement = document.getElementById('room-scan');
@@ -279,7 +260,7 @@ function main(): void {
       }
 
       // Pause simulation while scanning so Pac-Man cannot move away from the placed maze origin.
-      const isWaitingForBoardPlacement = renderer.xr.isPresenting && !hasBoardBeenPlaced;
+      const isWaitingForBoardPlacement = isArPresenting && !hasBoardBeenPlaced;
 
       if (!isWaitingForBoardPlacement) {
         timeSinceLastStep += elapsedSeconds;
@@ -290,15 +271,13 @@ function main(): void {
         }
       }
 
-      renderer.render(scene, camera);
+      renderer.render(scene, arSession.getRenderCamera() ?? camera);
     });
 
     // Remove listeners and GPU resources together; pagehide can otherwise leave XR/input callbacks alive.
     const handlePageHide = (): void => {
       renderer.setAnimationLoop(null);
-      activeXrSession?.removeEventListener('select', placeBoardOnSurface);
-      renderer.xr.removeEventListener('sessionstart', handleArSessionStart);
-      renderer.xr.removeEventListener('sessionend', handleArSessionEnd);
+      removeArListeners.forEach((removeListener) => removeListener());
       resetButton?.removeEventListener('click', resetGame);
       detachKeyboardInput();
       detachSwipeInput();
