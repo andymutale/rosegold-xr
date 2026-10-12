@@ -62,6 +62,12 @@ Check the available commands with `npm run` if the scripts differ in your checko
 
 For mobile and XR testing, use a compatible browser and device. Some immersive features require HTTPS and browser permissions.
 
+### AR backends
+
+AR prefers native WebXR (`immersive-ar`, e.g. Chrome on Android). On handheld devices without it — notably iOS Safari — the game falls back to camera-based instant tracking via the [Zappar Universal AR SDK](https://docs.zap.works/universal-ar/web-libraries/threejs/) (`src/xr/zapparSession.ts`). The Zappar SDK is only downloaded when that fallback is chosen. Room scanning (plane/mesh detection) is WebXR-only; with Zappar you point at the floor and tap to place the maze.
+
+Zappar's computer-vision library requires a ZapWorks licence when self-hosting on a public domain; `localhost`, `127.*`, `192.*`, `10.*` and ZapWorks-hosted domains work without registration.
+
 ## Current status
 
 Work in progress.

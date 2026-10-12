@@ -1,194 +1,189 @@
-import * as THREE from 'three';
-import { createXRStore } from '@pmndrs/xr';
+import type * as THREE from 'three';
 
-/** WebXR capabilities exposed to main.ts without exposing the XR store implementation. */
+import { createArButton } from '../ui/arButton';
+import type { SurfacePlacement } from './hitTest';
+import { createWebXrSession, isWebXrArSupported } from './webXrSession';
+
+export type ArBackendKind = 'webxr' | 'zappar';
+export type ArSessionEvent = 'sessionstart' | 'sessionend' | 'select';
+
+/** A floor pose in the active backend's world coordinates, with optional backend-specific sizing. */
+export interface ArPlacement extends SurfacePlacement {
+  /** Board scale for surface placement; main.ts falls back to its WebXR (metre-based) default. */
+  boardScale?: number;
+  /** Placement-marker scale; defaults to 1. */
+  markerScale?: number;
+}
+
+/** AR capabilities exposed to main.ts without exposing which backend (WebXR or Zappar) provides them. */
 export interface ArSession {
+  getBackend(): ArBackendKind | null;
+  isPresenting(): boolean;
+  /** Camera to render with while presenting, or null to keep using the scene camera. */
+  getRenderCamera(): THREE.Camera | null;
+  getReferenceSpace(): XRReferenceSpace | null;
   getHitTestSource(): XRHitTestSource | null;
+  getSurfacePlacement(frame: XRFrame | undefined): ArPlacement | null;
   getDetectedPlanes(): readonly XRPlane[];
   getDetectedMeshes(): readonly XRMesh[];
+  /** Subscribes to session lifecycle and placement taps; returns an unsubscribe function. */
+  addEventListener(type: ArSessionEvent, listener: () => void): () => void;
   update(frame: XRFrame | undefined, deltaMilliseconds: number): void;
   dispose(): void;
 }
 
-interface ArSessionOptions {
+/** A concrete backend. createArSession owns the Enter AR button and drives start/end. */
+export interface ArBackendSession extends Omit<ArSession, 'addEventListener'> {
+  readonly kind: ArBackendKind;
+  /** Must be called directly from a user gesture; backends may request permissions synchronously. */
+  start(): Promise<void>;
+  end(): void;
+}
+
+export interface ArSessionOptions {
   renderer: THREE.WebGLRenderer;
   scene: THREE.Scene;
   camera: THREE.PerspectiveCamera;
   onStatus: (message: string) => void;
 }
 
-/** Adapts the framework's vanilla XR store to the game's small session interface. */
-export const createArSession = ({ renderer, scene, camera, onStatus }: ArSessionOptions): ArSession => {
-  const enterArButton = document.getElementById('enter-ar-button') as HTMLButtonElement | null;
-  const domOverlayRoot = document.getElementById('game-ui');
-  if (!enterArButton) {
-    throw new Error('Missing #enter-ar-button in index.html');
+export interface ArBackendOptions extends ArSessionOptions {
+  emit: (type: ArSessionEvent) => void;
+}
+
+type ArBackendFactory = (options: ArBackendOptions) => ArBackendSession;
+
+const NO_PLANES: readonly XRPlane[] = [];
+const NO_MESHES: readonly XRMesh[] = [];
+
+/**
+ * Zappar's camera-based tracking needs a camera, a secure context and a handheld device with motion
+ * sensors. The SDK is imported lazily so WebXR-capable devices never download it.
+ */
+const loadZapparBackend = async (): Promise<ArBackendFactory | null> => {
+  if (!window.isSecureContext || typeof navigator.mediaDevices?.getUserMedia !== 'function') {
+    return null;
   }
-  if (!domOverlayRoot) {
-    throw new Error('Missing #game-ui DOM overlay in index.html');
+  if (!window.matchMedia?.('(pointer: coarse)').matches) {
+    return null;
   }
 
-  // This is the vanilla Three.js entry point from the supplied @pmndrs/xr repo.
-  // Plane, mesh and hit-test features are optional: devices that lack room
-  // understanding can still enter AR and use the existing hit-test fallback.
-  const xrStore = createXRStore(renderer.domElement, scene, () => camera, renderer.xr, {
-    offerSession: false,
-    enterGrantedSession: false,
-    emulate: false,
-    handTracking: false,
-    bodyTracking: false,
-    anchors: false,
-    layers: false,
-    hitTest: true,
-    planeDetection: true,
-    meshDetection: true,
-    // The XR DOM overlay must be a child element, never document.body itself.
-    domOverlay: domOverlayRoot,
-    hand: false,
-    controller: false,
-    gaze: false,
-    screenInput: false,
-    transientPointer: false,
-    htmlInput: false,
-  });
-
-  let hitTestSource: XRHitTestSource | null = null;
-  let activeXrSession: XRSession | null = null;
-  let disposed = false;
-  let arSupported = false;
-
-  // Hit-test setup is asynchronous; keep track of the session so late promises cannot revive stale state.
-  const handleArSessionStart = async (): Promise<void> => {
-    const session = renderer.xr.getSession() ?? null;
-    activeXrSession = session;
-    enterArButton.disabled = true;
-    enterArButton.textContent = 'AR active';
-    hitTestSource?.cancel();
-    hitTestSource = null;
-
-    if (!session) {
-      onStatus('AR started, but no XR session was available.');
-      return;
-    }
-
-    if (typeof session.requestHitTestSource !== 'function') {
-      onStatus('Hit testing is unavailable. The room scanner may still detect the floor.');
-      return;
-    }
-
-    try {
-      const viewerSpace = await session.requestReferenceSpace('viewer');
-      const nextHitTestSource = await session.requestHitTestSource({ space: viewerSpace });
-
-      if (!nextHitTestSource) {
-        onStatus('Hit testing is unavailable. The room scanner may still detect the floor.');
-        return;
-      }
-
-      if (activeXrSession !== session || disposed) {
-        nextHitTestSource.cancel();
-        return;
-      }
-
-      hitTestSource = nextHitTestSource;
-      onStatus('Move the phone slowly to scan the floor. Tap to fit the maze inside it.');
-    } catch (error) {
-      console.error('Unable to initialize AR hit testing:', error);
-      hitTestSource?.cancel();
-      hitTestSource = null;
-      onStatus('Hit testing failed. The room scanner may still work on this device.');
-    }
-  };
-
-  const handleArSessionEnd = (): void => {
-    hitTestSource?.cancel();
-    hitTestSource = null;
-    activeXrSession = null;
-    enterArButton.disabled = !arSupported;
-    enterArButton.textContent = 'Enter AR';
-    onStatus('AR ended. Use the keyboard or swipe controls to play.');
-  };
-
-  const handleEnterAr = async (): Promise<void> => {
-    if (enterArButton.disabled) {
-      return;
-    }
-
-    enterArButton.disabled = true;
-    enterArButton.textContent = 'Starting AR…';
-    try {
-      await xrStore.enterAR();
-    } catch (error) {
-      console.error('Unable to start immersive AR:', error);
-      onStatus('Could not start AR. Check browser/device support and use the 3D mode meanwhile.');
-    } finally {
-      if (!disposed) {
-        enterArButton.disabled = renderer.xr.isPresenting || !arSupported;
-        enterArButton.textContent = renderer.xr.isPresenting ? 'AR active' : 'Enter AR';
-      }
-    }
-  };
-
-  renderer.xr.addEventListener('sessionstart', handleArSessionStart);
-  renderer.xr.addEventListener('sessionend', handleArSessionEnd);
-  enterArButton.addEventListener('click', handleEnterAr);
-
-  void isArSupported().then((supported) => {
-    if (disposed) {
-      return;
-    }
-    arSupported = supported;
-    enterArButton.disabled = !supported || renderer.xr.isPresenting;
-    enterArButton.textContent = renderer.xr.isPresenting ? 'AR active' : supported ? 'Enter AR' : 'AR unavailable';
-    enterArButton.setAttribute('aria-disabled', String(!supported || renderer.xr.isPresenting));
-    enterArButton.title = supported
-      ? 'Start camera-based augmented reality'
-      : 'Immersive AR is not supported in this browser/device.';
-    if (!supported) {
-      onStatus('Immersive AR is unavailable here. You can still play the 3D game with swipe or keyboard controls.');
-    }
-  }).catch((error: unknown) => {
-    console.error('Unable to update AR availability:', error);
-    if (!disposed) {
-      onStatus('Could not check AR support. Try the 3D game controls.');
-    }
-  });
-
-  // The caller invokes this inside Three.js's XR animation loop, once for each available XR frame.
-  const update = (frame: XRFrame | undefined, deltaMilliseconds: number): void => {
-    xrStore.update(frame, deltaMilliseconds);
-  };
-
-  // Cancel the outstanding hit-test source and release all listeners/store subscriptions on page exit.
-  const dispose = (): void => {
-    disposed = true;
-    hitTestSource?.cancel();
-    hitTestSource = null;
-    activeXrSession = null;
-    renderer.xr.removeEventListener('sessionstart', handleArSessionStart);
-    renderer.xr.removeEventListener('sessionend', handleArSessionEnd);
-    enterArButton.removeEventListener('click', handleEnterAr);
-    xrStore.destroy();
-  };
-
-  return {
-    getHitTestSource: () => hitTestSource,
-    getDetectedPlanes: () => xrStore.getState().detectedPlanes,
-    getDetectedMeshes: () => xrStore.getState().detectedMeshes,
-    update,
-    dispose,
-  };
+  const zappar = await import('./zapparSession');
+  return zappar.isZapparSupported() ? zappar.createZapparSession : null;
 };
 
-const isArSupported = async (): Promise<boolean> => {
-  if (!('xr' in navigator) || !navigator.xr) {
-    return false;
+/** Single selection point: prefer native WebXR immersive-ar, otherwise fall back to Zappar. */
+export const detectArBackend = async (): Promise<ArBackendFactory | null> => {
+  if (await isWebXrArSupported()) {
+    return createWebXrSession;
   }
 
   try {
-    return await navigator.xr.isSessionSupported('immersive-ar');
+    return await loadZapparBackend();
   } catch (error) {
-    console.error('Immersive AR support check failed:', error);
-    return false;
+    console.error('Zappar AR fallback is unavailable:', error);
+    return null;
   }
+};
+
+/** Detects the best AR backend and adapts it to the game's session interface. */
+export const createArSession = (options: ArSessionOptions): ArSession => {
+  const { onStatus } = options;
+  const arButton = createArButton();
+  const listeners = new Map<ArSessionEvent, Set<() => void>>();
+  let backend: ArBackendSession | null = null;
+  let isStarting = false;
+  let disposed = false;
+
+  const emit = (type: ArSessionEvent): void => {
+    if (backend && type === 'sessionstart') {
+      arButton.setState('active', backend.kind);
+    } else if (backend && type === 'sessionend') {
+      arButton.setState('ready', backend.kind);
+    }
+
+    for (const listener of [...(listeners.get(type) ?? [])]) {
+      listener();
+    }
+  };
+
+  const handleArButtonClick = async (): Promise<void> => {
+    if (!backend || isStarting || disposed) {
+      return;
+    }
+
+    if (backend.isPresenting()) {
+      backend.end();
+      return;
+    }
+
+    isStarting = true;
+    arButton.setState('starting', backend.kind);
+    try {
+      await backend.start();
+    } catch (error) {
+      console.error('Unable to start AR:', error);
+      onStatus('Could not start AR. Check browser/device support and use the 3D mode meanwhile.');
+    } finally {
+      isStarting = false;
+      if (!disposed) {
+        arButton.setState(backend.isPresenting() ? 'active' : 'ready', backend.kind);
+      }
+    }
+  };
+
+  arButton.element.addEventListener('click', handleArButtonClick);
+
+  void detectArBackend()
+    .then((createBackend) => {
+      if (disposed) {
+        return;
+      }
+      if (!createBackend) {
+        arButton.setState('unavailable');
+        onStatus('AR is unavailable here. You can still play the 3D game with swipe or keyboard controls.');
+        return;
+      }
+
+      backend = createBackend({ ...options, emit });
+      arButton.setState(backend.isPresenting() ? 'active' : 'ready', backend.kind);
+    })
+    .catch((error: unknown) => {
+      console.error('Unable to update AR availability:', error);
+      if (!disposed) {
+        arButton.setState('unavailable');
+        onStatus('Could not check AR support. Try the 3D game controls.');
+      }
+    });
+
+  const addEventListener = (type: ArSessionEvent, listener: () => void): (() => void) => {
+    const typeListeners = listeners.get(type) ?? new Set<() => void>();
+    typeListeners.add(listener);
+    listeners.set(type, typeListeners);
+    return () => {
+      typeListeners.delete(listener);
+    };
+  };
+
+  const dispose = (): void => {
+    disposed = true;
+    listeners.clear();
+    arButton.element.removeEventListener('click', handleArButtonClick);
+    backend?.dispose();
+    backend = null;
+  };
+
+  return {
+    getBackend: () => backend?.kind ?? null,
+    isPresenting: () => backend?.isPresenting() ?? false,
+    getRenderCamera: () => backend?.getRenderCamera() ?? null,
+    getReferenceSpace: () => backend?.getReferenceSpace() ?? null,
+    getHitTestSource: () => backend?.getHitTestSource() ?? null,
+    getSurfacePlacement: (frame) => backend?.getSurfacePlacement(frame) ?? null,
+    getDetectedPlanes: () => backend?.getDetectedPlanes() ?? NO_PLANES,
+    getDetectedMeshes: () => backend?.getDetectedMeshes() ?? NO_MESHES,
+    addEventListener,
+    update: (frame, deltaMilliseconds) => backend?.update(frame, deltaMilliseconds),
+    dispose,
+  };
 };
