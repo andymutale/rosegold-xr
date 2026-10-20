@@ -1,8 +1,7 @@
-import { Clock, MeshBasicMaterial } from 'three';
-
+import { Clock, MeshBasicMaterial, Vector3 } from 'three';
 import { createGame } from './game/game';
-import { generateRoomMaze } from './game/generateRoomMaze';
-import type { GameState } from './game/types';
+import { createReferenceMaze } from './game/referenceMaze';
+import type { Direction, GameState } from './game/types';
 import { attachKeyboardInput } from './input/keyboardInput';
 import { attachSwipeInput } from './input/swipeInput';
 import { createBoardRenderer } from './render/boardRenderer';
@@ -11,24 +10,19 @@ import { createPlacementMarker, placeAtSurface } from './render/placementMarker'
 import { createScene } from './render/scene';
 import { showGameState, showStatusMessage } from './ui/hud';
 import { createArSession, type ArPlacement } from './xr/arSession';
-import { createRoomUnderstanding, fitBoardToRoomFloor } from './xr/roomUnderstanding';
+import { createRoomUnderstanding } from './xr/roomUnderstanding';
 
 /** Keeps game simulation speed independent from the display refresh rate. */
 const GAME_STEP_SECONDS = 0.16;
-const MARKER_HEIGHT_OFFSET = 0.01;
+const MARKER_HEIGHT_OFFSET = 0.012;
 const FALLBACK_GRID_DIMENSION = 1;
 const DEFAULT_BOARD_SCALE = 1;
-const FALLBACK_AR_BOARD_SCALE = 0.25;
+const AR_TARGET_BOARD_METERS = 0.95;
+const ZAPPAR_TARGET_BOARD_UNITS = 1.9;
 const RESET_BUTTON_ID = 'reset-button';
 
-/** Small, deterministic layout used before AR placement and outside AR mode. */
-const MAZE: string[] = [
-  '#########',
-  '#P..#...#',
-  '#.##.##.#',
-  '#..G....#',
-  '#########',
-];
+/** A repeatable, photo-inspired tabletop layout for both desktop and AR. */
+const MAZE: string[] = createReferenceMaze(25, 25);
 
 const getGridDimensions = ({ grid }: Pick<GameState, 'grid'>): { gridWidth: number; gridHeight: number } => ({
   gridWidth: grid[0]?.length ?? FALLBACK_GRID_DIMENSION,
@@ -46,15 +40,30 @@ function main(): void {
     const placementMarker = createPlacementMarker();
     scene.add(placementMarker);
     const roomUnderstanding = createRoomUnderstanding(scene);
-
     const detachKeyboardInput = attachKeyboardInput(game);
     const detachSwipeInput = attachSwipeInput({ element: window, onDirection: game.requestDirection });
     const resetButton = document.getElementById(RESET_BUTTON_ID);
+    const directionButtons = Array.from(document.querySelectorAll<HTMLButtonElement>('[data-direction]'));
+    const directionButtonHandlers = new Map<HTMLButtonElement, () => void>();
+    directionButtons.forEach((button) => {
+      const direction = button.dataset.direction as Direction | undefined;
+      if (!direction) return;
+      const handler = (): void => game.requestDirection(direction);
+      directionButtonHandlers.set(button, handler);
+      button.addEventListener('click', handler);
+    });
+
     const clock = new Clock();
     const startingState = game.getState();
-    let gridDimensions = getGridDimensions(startingState);
+    const gridDimensions = getGridDimensions(startingState);
+    const getArBoardScale = (): number => {
+      const targetSpan = arSession.getBackend() === 'zappar'
+        ? ZAPPAR_TARGET_BOARD_UNITS
+        : AR_TARGET_BOARD_METERS;
+      return targetSpan / Math.max(gridDimensions.gridWidth, gridDimensions.gridHeight);
+    };
 
-    // Keep full redraws in one place so startup, reset, and maze replacement stay in sync.
+    // Keep full redraws in one place so startup and reset stay in sync.
     const drawGame = (state: GameState): void => {
       boardRenderer.drawGrid(state.grid);
       characterRenderer.updatePositions(state);
@@ -63,7 +72,7 @@ function main(): void {
 
     drawGame(startingState);
     positionCameraForBoard(gridDimensions);
-    showStatusMessage('Use arrow keys, WASD, or swipe to move. Enter AR to place the maze.');
+    showStatusMessage('Use WASD, arrow keys, swipe, or the on-screen pad. Enter AR to place the tabletop maze.');
 
     let timeSinceLastStep = 0;
     let previousScore = startingState.score;
@@ -73,68 +82,63 @@ function main(): void {
     let previousRoomScanLabel = '';
     let floorWasDetected = false;
 
-    // Called by the AR session's 'select' event (a screen tap in handheld AR), not by every frame.
+    // Places the same compact reference board on a tapped surface; no room-wide stretching.
     const placeBoardOnSurface = (): void => {
-      if (!arSession.isPresenting() || hasBoardBeenPlaced) {
-        return;
-      }
+      if (!arSession.isPresenting() || hasBoardBeenPlaced) return;
 
-      if (latestRoomFloor) {
-        // A detected floor gives us room dimensions, so replace the demo maze before scaling it.
-        const roomMazeRows = generateRoomMaze({
-          roomWidth: latestRoomFloor.width,
-          roomDepth: latestRoomFloor.depth,
-        });
-        game.setMaze(roomMazeRows);
-        const roomMazeState = game.getState();
-        gridDimensions = getGridDimensions(roomMazeState);
-        previousScore = roomMazeState.score;
-        timeSinceLastStep = 0;
-        drawGame(roomMazeState);
-
-        const fittedPlacement = fitBoardToRoomFloor({
-          floor: latestRoomFloor,
-          gridWidth: gridDimensions.gridWidth,
-          gridHeight: gridDimensions.gridHeight,
-        });
-        placeAtSurface({ object: boardRenderer.board, ...fittedPlacement });
+      const boardScale = getArBoardScale();
+      if (latestSurfacePlacement) {
+        const { position, quaternion } = latestSurfacePlacement;
+        // The hit-test ring marks the board centre, while maze coordinates begin at (0, 0).
+        const boardOriginOffset = new Vector3(
+          -((gridDimensions.gridWidth - 1) * boardScale) / 2,
+          MARKER_HEIGHT_OFFSET,
+          -((gridDimensions.gridHeight - 1) * boardScale) / 2,
+        );
+        const boardOrigin = position.clone().add(boardOriginOffset.applyQuaternion(quaternion));
+        placeAtSurface({ object: boardRenderer.board, position: boardOrigin, quaternion, scale: boardScale });
         boardRenderer.board.visible = true;
         hasBoardBeenPlaced = true;
         placementMarker.visible = false;
         showStatusMessage(
-          `Room maze ready: ${gridDimensions.gridWidth} × ${gridDimensions.gridHeight} tiles across a ${latestRoomFloor.width.toFixed(1)} × ${latestRoomFloor.depth.toFixed(1)} m floor. Swipe to move.`,
+          arSession.getBackend() === 'zappar'
+            ? 'Maze placed. Swipe or use the pad to collect the square pellets.'
+            : 'Maze placed at tabletop scale. Swipe or use the pad to collect the square pellets.',
         );
         return;
       }
 
-      // Surface placement (WebXR hit testing or Zappar instant tracking) keeps AR playable on
-      // devices that do not expose plane detection. It intentionally uses a smaller, phone-friendly board.
-      if (!latestSurfacePlacement) {
-        showStatusMessage('Still scanning for a floor. Move the phone slowly, then tap again.');
+      // Plane detection remains a fallback on devices that expose room planes but no hit-test pose.
+      if (latestRoomFloor) {
+        const localOffset = new Vector3(
+          latestRoomFloor.centerX - ((gridDimensions.gridWidth - 1) * boardScale) / 2,
+          MARKER_HEIGHT_OFFSET,
+          latestRoomFloor.centerZ - ((gridDimensions.gridHeight - 1) * boardScale) / 2,
+        );
+        const position = latestRoomFloor.position.clone().add(
+          localOffset.applyQuaternion(latestRoomFloor.quaternion),
+        );
+        placeAtSurface({
+          object: boardRenderer.board,
+          position,
+          quaternion: latestRoomFloor.quaternion,
+          scale: boardScale,
+        });
+        boardRenderer.board.visible = true;
+        hasBoardBeenPlaced = true;
+        placementMarker.visible = false;
+        showStatusMessage('Maze placed on the detected horizontal surface. Swipe or use the pad to play.');
         return;
       }
 
-      const { position, quaternion, boardScale = FALLBACK_AR_BOARD_SCALE } = latestSurfacePlacement;
-      placeAtSurface({ object: boardRenderer.board, position, quaternion, scale: boardScale });
-      boardRenderer.board.visible = true;
-      hasBoardBeenPlaced = true;
-      placementMarker.visible = false;
-      showStatusMessage(
-        arSession.getBackend() === 'zappar'
-          ? 'Maze placed using camera tracking. Swipe to move.'
-          : 'Maze placed using surface hit testing. Room fitting is unavailable on this device.',
-      );
+      showStatusMessage('Still looking for a flat surface. Move the phone slowly, point at the tabletop, then tap again.');
     };
 
     const stepGame = (): void => {
       game.step();
       const state = game.getState();
-
-      // Pellet tiles change only when score changes, so static walls need no redraw on ordinary steps.
-      if (state.score !== previousScore) {
-        boardRenderer.drawGrid(state.grid);
-      }
-
+      // Pellet instances change only when score changes; the detailed walls stay in place.
+      if (state.score !== previousScore) boardRenderer.drawGrid(state.grid);
       previousScore = state.score;
       characterRenderer.updatePositions(state);
       showGameState(state);
@@ -148,12 +152,12 @@ function main(): void {
       drawGame(state);
       showStatusMessage(
         arSession.isPresenting() && !hasBoardBeenPlaced
-          ? 'Move the phone slowly to scan the room floor, then tap to place the maze.'
-          : 'Game reset. Use arrow keys, WASD, or swipe to move.',
+          ? 'Point at a flat surface and tap to place the maze.'
+          : 'Game reset. Use the pad, swipe, WASD, or arrow keys to play.',
       );
     };
 
-    // Every AR session starts with a fresh scan and requires a new placement tap.
+    // Each AR session begins with a fresh scan and requires a new placement tap.
     const handleArSessionStart = (): void => {
       latestSurfacePlacement = null;
       latestRoomFloor = null;
@@ -164,15 +168,11 @@ function main(): void {
       boardRenderer.board.visible = false;
       roomUnderstanding.clear();
       const roomScanElement = document.getElementById('room-scan');
-      if (roomScanElement) roomScanElement.textContent = 'Room scan: scanning…';
-      showStatusMessage(
-        arSession.getBackend() === 'zappar'
-          ? 'Point the camera at the floor, then tap to place the maze.'
-          : 'Move the phone slowly to scan the room floor. Tap to fit the maze inside the detected floor.',
-      );
+      if (roomScanElement) roomScanElement.textContent = 'Surface scan: looking for a flat area…';
+      showStatusMessage('Move the phone slowly over a tabletop, then tap when the placement ring appears.');
     };
 
-    // AR coordinates are session-relative; restore the known demo layout and origin after leaving AR.
+    // The board returns to its known origin in 3D mode after AR ends.
     const handleArSessionEnd = (): void => {
       latestSurfacePlacement = null;
       latestRoomFloor = null;
@@ -181,10 +181,9 @@ function main(): void {
       previousRoomScanLabel = '';
       roomUnderstanding.clear();
       const roomScanElement = document.getElementById('room-scan');
-      if (roomScanElement) roomScanElement.textContent = 'Room scan: inactive until AR starts.';
+      if (roomScanElement) roomScanElement.textContent = 'Surface scan: inactive until AR starts.';
       game.setMaze(MAZE);
       const defaultState = game.getState();
-      gridDimensions = getGridDimensions(defaultState);
       previousScore = defaultState.score;
       drawGame(defaultState);
       placementMarker.visible = false;
@@ -194,7 +193,7 @@ function main(): void {
       boardRenderer.board.scale.setScalar(DEFAULT_BOARD_SCALE);
       boardRenderer.board.updateMatrix();
       positionCameraForBoard(gridDimensions);
-      showStatusMessage('AR ended. Use keyboard or swipe controls to play.');
+      showStatusMessage('Back in 3D mode. Use the pad, swipe, WASD, or arrow keys to play.');
     };
 
     resetButton?.addEventListener('click', resetGame);
@@ -208,9 +207,8 @@ function main(): void {
       const elapsedSeconds = clock.getDelta();
       const isArPresenting = arSession.isPresenting();
 
-      // WebXR delivers an XRFrame here; camera-tracked (Zappar) AR runs without one.
+      // WebXR supplies an XRFrame; Zappar camera tracking runs without one.
       if (isArPresenting && (frame || arSession.getBackend() !== 'webxr')) {
-        // Update the session before reading its plane/mesh arrays; they are refreshed from this frame.
         arSession.update(frame, elapsedSeconds * 1000);
         const referenceSpace = arSession.getReferenceSpace();
         latestSurfacePlacement = arSession.getSurfacePlacement(frame);
@@ -223,28 +221,28 @@ function main(): void {
             )
           : { floor: null, planeCount: 0, meshCount: 0 };
         latestRoomFloor = roomScan.floor;
-
-        const floorDimensions = latestRoomFloor
-          ? `${latestRoomFloor.width.toFixed(1)} × ${latestRoomFloor.depth.toFixed(1)} m`
-          : 'looking for a large horizontal floor';
+        const surfaceSummary = latestSurfacePlacement
+          ? 'surface target found · tap to place'
+          : latestRoomFloor
+            ? `large surface ${latestRoomFloor.width.toFixed(1)} × ${latestRoomFloor.depth.toFixed(1)} m`
+            : 'looking for a flat surface';
         const roomScanLabel = arSession.getBackend() === 'zappar'
-          ? 'not available with camera tracking · tap to place'
-          : `${roomScan.planeCount} planes · ${roomScan.meshCount} meshes · ${floorDimensions}`;
+          ? 'camera tracking · point at a tabletop and tap'
+          : `${roomScan.planeCount} planes · ${roomScan.meshCount} meshes · ${surfaceSummary}`;
         if (roomScanLabel !== previousRoomScanLabel) {
           const roomScanElement = document.getElementById('room-scan');
-          if (roomScanElement) roomScanElement.textContent = `Room scan: ${roomScanLabel}`;
+          if (roomScanElement) roomScanElement.textContent = `Surface scan: ${roomScanLabel}`;
           previousRoomScanLabel = roomScanLabel;
         }
 
         if (latestRoomFloor && !floorWasDetected && !hasBoardBeenPlaced) {
           floorWasDetected = true;
           showStatusMessage(
-            `Floor detected (${latestRoomFloor.width.toFixed(1)} × ${latestRoomFloor.depth.toFixed(1)} m). Tap to fit the maze.`,
+            `Horizontal area detected (${latestRoomFloor.width.toFixed(1)} × ${latestRoomFloor.depth.toFixed(1)} m). Tap to place the compact board.`,
           );
         }
 
-        placementMarker.visible = latestSurfacePlacement !== null && !hasBoardBeenPlaced && !latestRoomFloor;
-
+        placementMarker.visible = latestSurfacePlacement !== null && !hasBoardBeenPlaced;
         if (placementMarker.visible && latestSurfacePlacement) {
           const { position, quaternion, markerScale = 1 } = latestSurfacePlacement;
           placeAtSurface({ object: placementMarker, position, quaternion, scale: markerScale });
@@ -255,30 +253,28 @@ function main(): void {
         latestRoomFloor = null;
         roomUnderstanding.clear();
         const roomScanElement = document.getElementById('room-scan');
-        if (roomScanElement) roomScanElement.textContent = 'Room scan: inactive until AR starts.';
+        if (roomScanElement) roomScanElement.textContent = 'Surface scan: inactive until AR starts.';
         placementMarker.visible = false;
       }
 
-      // Pause simulation while scanning so Pac-Man cannot move away from the placed maze origin.
+      // Pause movement until the player locks the board to a surface in AR.
       const isWaitingForBoardPlacement = isArPresenting && !hasBoardBeenPlaced;
-
       if (!isWaitingForBoardPlacement) {
         timeSinceLastStep += elapsedSeconds;
-
         if (timeSinceLastStep >= GAME_STEP_SECONDS) {
           timeSinceLastStep = 0;
           stepGame();
         }
       }
-
       renderer.render(scene, arSession.getRenderCamera() ?? camera);
     });
 
-    // Remove listeners and GPU resources together; pagehide can otherwise leave XR/input callbacks alive.
+    // Remove listeners and GPU resources together so page navigation leaves no live callbacks.
     const handlePageHide = (): void => {
       renderer.setAnimationLoop(null);
       removeArListeners.forEach((removeListener) => removeListener());
       resetButton?.removeEventListener('click', resetGame);
+      directionButtonHandlers.forEach((handler, button) => button.removeEventListener('click', handler));
       detachKeyboardInput();
       detachSwipeInput();
       arSession.dispose();
@@ -289,7 +285,6 @@ function main(): void {
       (placementMarker.material as MeshBasicMaterial).dispose();
       disposeScene();
     };
-
     window.addEventListener('pagehide', handlePageHide, { once: true });
   } catch (error) {
     console.error('Failed to initialize the maze game:', error);
