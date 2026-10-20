@@ -43,6 +43,29 @@ function main(): void {
     const detachKeyboardInput = attachKeyboardInput(game);
     const detachSwipeInput = attachSwipeInput({ element: window, onDirection: game.requestDirection });
     const resetButton = document.getElementById(RESET_BUTTON_ID);
+    const gameUi = document.getElementById('game-ui');
+    const hudHide = document.getElementById('hud-hide');
+    const hudReopen = document.getElementById('hud-reopen');
+    const setHudVisible = (visible: boolean): void => {
+      if (!gameUi || !hudReopen) return;
+      gameUi.hidden = !visible;
+      hudReopen.hidden = visible;
+    };
+    const hideHud = (): void => setHudVisible(false);
+    const showHud = (): void => setHudVisible(true);
+    hudHide?.addEventListener('click', hideHud);
+    hudReopen?.addEventListener('click', showHud);
+    const infoToggle = document.getElementById('info-toggle') as HTMLButtonElement | null;
+    const gameInfo = document.getElementById('game-info');
+    const setGameInfoOpen = (open: boolean): void => {
+      if (!infoToggle || !gameInfo) return;
+      gameInfo.hidden = !open;
+      infoToggle.setAttribute('aria-expanded', String(open));
+      infoToggle.setAttribute('aria-label', open ? 'Hide game information' : 'Show game information');
+      infoToggle.textContent = open ? 'Close' : 'Info';
+    };
+    const toggleGameInfo = (): void => setGameInfoOpen(Boolean(gameInfo?.hidden));
+    infoToggle?.addEventListener('click', toggleGameInfo);
     const directionButtons = Array.from(document.querySelectorAll<HTMLButtonElement>('[data-direction]'));
     const directionButtonHandlers = new Map<HTMLButtonElement, () => void>();
     directionButtons.forEach((button) => {
@@ -100,6 +123,8 @@ function main(): void {
         boardRenderer.board.visible = true;
         hasBoardBeenPlaced = true;
         placementMarker.visible = false;
+        setGameInfoOpen(false);
+        setHudVisible(false);
         showStatusMessage(
           arSession.getBackend() === 'zappar'
             ? 'Maze placed. Swipe or use the pad to collect the square pellets.'
@@ -127,6 +152,8 @@ function main(): void {
         boardRenderer.board.visible = true;
         hasBoardBeenPlaced = true;
         placementMarker.visible = false;
+        setGameInfoOpen(false);
+        setHudVisible(false);
         showStatusMessage('Maze placed on the detected horizontal surface. Swipe or use the pad to play.');
         return;
       }
@@ -159,6 +186,9 @@ function main(): void {
 
     // Each AR session begins with a fresh scan and requires a new placement tap.
     const handleArSessionStart = (): void => {
+      // Keep the camera view clear when entering immersive play.
+      setGameInfoOpen(false);
+      setHudVisible(false);
       latestSurfacePlacement = null;
       latestRoomFloor = null;
       hasBoardBeenPlaced = false;
@@ -174,6 +204,7 @@ function main(): void {
 
     // The board returns to its known origin in 3D mode after AR ends.
     const handleArSessionEnd = (): void => {
+      setHudVisible(true);
       latestSurfacePlacement = null;
       latestRoomFloor = null;
       hasBoardBeenPlaced = false;
@@ -274,6 +305,9 @@ function main(): void {
       renderer.setAnimationLoop(null);
       removeArListeners.forEach((removeListener) => removeListener());
       resetButton?.removeEventListener('click', resetGame);
+      hudHide?.removeEventListener('click', hideHud);
+      hudReopen?.removeEventListener('click', showHud);
+      infoToggle?.removeEventListener('click', toggleGameInfo);
       directionButtonHandlers.forEach((handler, button) => button.removeEventListener('click', handler));
       detachKeyboardInput();
       detachSwipeInput();
